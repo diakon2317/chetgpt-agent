@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from patchright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 SESSION_FILE = "session.json"
 LOGIN_URL = "https://chatgpt.com/auth/login"
@@ -55,13 +55,8 @@ class BrowserManager:
             print(f"[DEBUG] Screenshot failed: {e}")
 
     async def _stealth_init(self):
-        """Скрываем признаки headless/automation от Cloudflare и JS-детекторов."""
-        await self._context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            window.chrome = { runtime: {} };
-        """)
+        # patchright patches the binary — no JS overrides needed
+        pass
 
     async def start(self):
         self._pw = await async_playwright().start()
@@ -70,12 +65,7 @@ class BrowserManager:
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--disable-extensions",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--window-size=1280,800",
+                "--lang=en-US",
             ],
         )
         if Path(SESSION_FILE).exists():

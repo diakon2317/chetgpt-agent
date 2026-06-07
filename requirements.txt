@@ -1,4 +1,4 @@
-playwright
+patchright
 mysql-connector-python
 python-dotenv
 fastapi
