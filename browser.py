@@ -60,14 +60,31 @@ class BrowserManager:
     async def _check_session(self) -> bool:
         print("[AUTH] Checking saved session...")
         await self._page.goto(CHAT_URL, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
         await self._save_screenshot("session_check")
-        try:
-            await self._page.wait_for_selector("textarea#prompt-textarea", timeout=12000)
-            print("[AUTH] Session valid — already logged in")
-            return True
-        except PlaywrightTimeout:
-            print(f"[AUTH] Session expired or invalid (URL: {self._page.url})")
-            return False
+        print(f"[AUTH] Session check URL: {self._page.url}")
+
+        # Try multiple selectors — ChatGPT changes its UI periodically
+        selectors = [
+            "textarea#prompt-textarea",
+            "div#prompt-textarea",
+            "[data-testid='send-button']",
+            "div[contenteditable='true']",
+            "main textarea",
+        ]
+        for sel in selectors:
+            try:
+                await self._page.wait_for_selector(sel, timeout=8000)
+                print(f"[AUTH] Session valid — chat interface found ({sel})")
+                return True
+            except PlaywrightTimeout:
+                continue
+
+        print(f"[AUTH] Session check failed — no chat UI found. URL: {self._page.url}")
+        # Save HTML for diagnosis
+        html = await self._page.content()
+        (DEBUG_DIR / f"{_ts()}_session_check.html").write_text(html, encoding="utf-8")
+        return False
 
     async def screenshot(self) -> bytes:
         return await self._page.screenshot(full_page=True)
