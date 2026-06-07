@@ -20,7 +20,6 @@ CHAT_SELECTORS = [
     "div#prompt-textarea",
     "textarea#prompt-textarea",
     "[data-testid='send-button']",
-    "div[contenteditable='true']",
 ]
 
 
@@ -65,34 +64,65 @@ class BrowserManager:
         else:
             await self._make_context()
 
-    async def _check_session(self) -> bool:
-        """Navigate to chatgpt.com and wait up to 30s for CF to auto-solve."""
-        print("[AUTH] Checking saved session...")
-        await self._page.goto(CHAT_URL, wait_until="domcontentloaded")
-
-        # CF managed challenge can take up to 15s to auto-resolve with patchright
-        # We poll the page title: "Just a moment..." = still in CF challenge
-        for i in range(6):
-            await asyncio.sleep(5)
+    async def _handle_cf(self) -> bool:
+        """
+        Try to get past Cloudflare challenge.
+        Attempts auto-solve wait, then tries clicking the Turnstile checkbox.
+        Returns True if CF is no longer blocking.
+        """
+        for attempt in range(4):
             title = await self._page.title()
             url = self._page.url
-            print(f"[AUTH] Wait {(i+1)*5}s — title: '{title}', url: {url}")
-            if "just a moment" not in title.lower():
-                break
+            print(f"[CF] Attempt {attempt+1}: title='{title}', url={url}")
 
-        await self._save_screenshot("session_check")
+            if "just a moment" not in title.lower():
+                return True
+
+            await self._save_screenshot(f"cf_attempt_{attempt+1}")
+
+            # Try clicking the Turnstile checkbox inside the CF iframe
+            try:
+                cf_el = await self._page.wait_for_selector(
+                    "iframe[src*='challenges.cloudflare.com']", timeout=3000
+                )
+                cf_frame = await cf_el.content_frame()
+                if cf_frame:
+                    cb = await cf_frame.wait_for_selector("input[type='checkbox']", timeout=2000)
+                    await cb.click()
+                    print(f"[CF] Clicked Turnstile checkbox")
+            except Exception as e:
+                print(f"[CF] Checkbox not found: {e}")
+
+            await asyncio.sleep(8)
+
+        title = await self._page.title()
+        return "just a moment" not in title.lower()
+
+    async def _navigate_and_wait(self, url: str) -> bool:
+        """Navigate to URL and handle CF challenge. Returns True if chat UI is reachable."""
+        await self._page.goto(url, wait_until="domcontentloaded")
+        cf_passed = await self._handle_cf()
+        if not cf_passed:
+            await self._save_screenshot("nav_cf_blocked")
+            return False
+        return True
+
+    async def _check_session(self) -> bool:
+        print("[AUTH] Checking saved session...")
+        ok = await self._navigate_and_wait(CHAT_URL)
+        if not ok:
+            print("[AUTH] Session check failed — CF blocked")
+            return False
 
         for sel in CHAT_SELECTORS:
             try:
-                await self._page.wait_for_selector(sel, timeout=5000)
-                print(f"[AUTH] Session valid — chat UI found ({sel})")
+                await self._page.wait_for_selector(sel, timeout=8000)
+                print(f"[AUTH] Session valid ({sel})")
                 return True
             except PlaywrightTimeout:
                 continue
 
-        print(f"[AUTH] Session check failed. URL: {self._page.url}")
-        html = await self._page.content()
-        (DEBUG_DIR / f"{_ts()}_session_check.html").write_text(html, encoding="utf-8")
+        print(f"[AUTH] Session check failed — no chat UI. URL: {self._page.url}")
         return False
 
     async def screenshot(self) -> bytes:
@@ -102,19 +132,13 @@ class BrowserManager:
         return await self._page.content()
 
     async def import_cookies(self, cookies: list) -> bool:
-        """
-        Add auth cookies from Cookie Editor export to the existing context.
-        CF cookies are skipped (IP-tied). No second navigation is done —
-        the actual test is when /ask is first called.
-        """
         def _samesite(v: str) -> str:
             return {"lax": "Lax", "strict": "Strict", "no_restriction": "None", "none": "None"}.get(
                 (v or "").lower(), "Lax"
             )
 
-        pw_cookies = []
-        for c in cookies:
-            pw_cookies.append({
+        pw_cookies = [
+            {
                 "name": c["name"],
                 "value": c["value"],
                 "domain": c.get("domain", ".chatgpt.com"),
@@ -123,30 +147,29 @@ class BrowserManager:
                 "httpOnly": bool(c.get("httpOnly", False)),
                 "secure": bool(c.get("secure", False)),
                 "sameSite": _samesite(c.get("sameSite", "lax")),
-            })
+            }
+            for c in cookies
+        ]
 
-        # Import all cookies — CF cookies are valid when source IP matches server IP
         await self._context.add_cookies(pw_cookies)
-        print(f"[AUTH] Added {len(pw_cookies)} cookies to existing context")
+        print(f"[AUTH] Added {len(pw_cookies)} cookies to context")
 
-        # Save merged state — do NOT navigate again to avoid triggering CF
         await self._context.storage_state(path=SESSION_FILE)
-        print(f"[AUTH] Session saved to {SESSION_FILE}. Use /ask to verify.")
+        print(f"[AUTH] Session saved to {SESSION_FILE}")
 
         self.logged_in = True
         return True
 
-    async def send_prompt(self, prompt: str) -> str:
-        await self._page.goto(CHAT_URL, wait_until="domcontentloaded")
+    async def send_prompt(self, prompt: str, chat_id: str | None = None) -> tuple[str, str | None]:
+        """
+        Send a prompt to ChatGPT.
+        If chat_id is given, continues that conversation.
+        Returns (response_text, chat_id).
+        """
+        target_url = f"https://chatgpt.com/c/{chat_id}" if chat_id else CHAT_URL
 
-        # Wait up to 60s for CF managed challenge to auto-resolve
-        try:
-            await self._page.wait_for_function(
-                "() => !document.title.toLowerCase().includes('just a moment')",
-                timeout=60000,
-            )
-        except PlaywrightTimeout:
-            await self._save_screenshot("send_prompt_cf_block")
+        ok = await self._navigate_and_wait(target_url)
+        if not ok:
             self.logged_in = False
             raise RuntimeError("Cloudflare is blocking. Re-import cookies via POST /login/cookies.")
 
@@ -156,7 +179,7 @@ class BrowserManager:
             )
         except PlaywrightTimeout:
             title = await self._page.title()
-            await self._save_screenshot("send_prompt_no_textarea")
+            await self._save_screenshot("no_textarea")
             raise RuntimeError(f"Chat input not found. Title: '{title}', URL: {self._page.url}")
 
         await textarea.click()
@@ -166,14 +189,20 @@ class BrowserManager:
         # Wait for generation to start
         await self._page.wait_for_selector("button[data-testid='stop-button']", timeout=15000)
 
-        # ChatGPT replaces stop-button with send-button in the same DOM node —
-        # waiting for "detached" never fires; wait for send-button to reappear instead
+        # Wait for generation to finish (stop → send button)
         await self._page.wait_for_selector("button[data-testid='send-button']", timeout=90000)
 
         messages = await self._page.query_selector_all("[data-message-author-role='assistant']")
         if not messages:
             raise RuntimeError("No assistant response found")
-        return (await messages[-1].inner_text()).strip()
+
+        response_text = (await messages[-1].inner_text()).strip()
+
+        # Extract chat_id from URL  (https://chatgpt.com/c/<uuid>)
+        current_url = self._page.url
+        new_chat_id = current_url.split("/c/")[-1].split("?")[0] if "/c/" in current_url else chat_id
+
+        return response_text, new_chat_id
 
     async def stop(self):
         if self._page:
