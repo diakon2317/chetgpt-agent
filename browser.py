@@ -116,9 +116,16 @@ class BrowserManager:
                 "sameSite": _samesite(c.get("sameSite", "lax")),
             })
 
-        # Add to existing context — preserves any CF clearance the browser already has
-        await self._context.add_cookies(pw_cookies)
-        print(f"[AUTH] Added {len(pw_cookies)} cookies to existing context")
+        # Drop Cloudflare cookies — they are IP-tied to the source browser.
+        # The server's own CF clearance must be preserved.
+        cf_prefixes = ("cf_", "__cf", "_cf")
+        auth_cookies = [c for c in pw_cookies if not any(c["name"].lower().startswith(p) for p in cf_prefixes)]
+        skipped = [c["name"] for c in pw_cookies if c not in auth_cookies]
+        if skipped:
+            print(f"[AUTH] Skipped CF cookies (IP-tied): {skipped}")
+
+        await self._context.add_cookies(auth_cookies)
+        print(f"[AUTH] Added {len(auth_cookies)} auth cookies to existing context")
 
         # Save the merged state (server CF cookies + user auth cookies)
         await self._context.storage_state(path=SESSION_FILE)
