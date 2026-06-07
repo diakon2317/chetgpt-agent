@@ -71,11 +71,18 @@ class BrowserManager:
         Returns True if CF is no longer blocking.
         """
         for attempt in range(4):
+            # Wait for title to be non-empty (CF page starts with empty title)
+            try:
+                await self._page.wait_for_function("() => document.title.length > 0", timeout=5000)
+            except PlaywrightTimeout:
+                pass
+
             title = await self._page.title()
             url = self._page.url
             print(f"[CF] Attempt {attempt+1}: title='{title}', url={url}")
 
-            if "just a moment" not in title.lower():
+            is_cf_blocked = "just a moment" in title.lower() or "__cf_chl" in url
+            if not is_cf_blocked:
                 return True
 
             await self._save_screenshot(f"cf_attempt_{attempt+1}")
@@ -95,8 +102,13 @@ class BrowserManager:
 
             await asyncio.sleep(8)
 
+        try:
+            await self._page.wait_for_function("() => document.title.length > 0", timeout=5000)
+        except PlaywrightTimeout:
+            pass
         title = await self._page.title()
-        return "just a moment" not in title.lower()
+        url = self._page.url
+        return "just a moment" not in title.lower() and "__cf_chl" not in url
 
     async def _navigate_and_wait(self, url: str) -> bool:
         """Navigate to URL and handle CF challenge. Returns True if chat UI is reachable."""
