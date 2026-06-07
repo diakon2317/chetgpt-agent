@@ -164,10 +164,12 @@ class BrowserManager:
         await textarea.fill(prompt)
         await self._page.keyboard.press("Enter")
 
+        # Wait for generation to start
         await self._page.wait_for_selector("button[data-testid='stop-button']", timeout=15000)
-        await self._page.wait_for_selector(
-            "button[data-testid='stop-button']", state="detached", timeout=120000
-        )
+
+        # ChatGPT replaces stop-button with send-button in the same DOM node —
+        # waiting for "detached" never fires; wait for send-button to reappear instead
+        await self._page.wait_for_selector("button[data-testid='send-button']", timeout=90000)
 
         messages = await self._page.query_selector_all("[data-message-author-role='assistant']")
         if not messages:
