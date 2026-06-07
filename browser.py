@@ -9,10 +9,11 @@ SESSION_FILE = "session.json"
 CHAT_URL = "https://chatgpt.com/"
 DEBUG_DIR = Path("debug_screenshots")
 
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
+USER_AGENT = os.getenv(
+    "BROWSER_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+    "Chrome/136.0.0.0 Safari/537.36",
 )
 
 CHAT_SELECTORS = [
@@ -138,13 +139,16 @@ class BrowserManager:
     async def send_prompt(self, prompt: str) -> str:
         await self._page.goto(CHAT_URL, wait_until="domcontentloaded")
 
-        # Wait for CF to auto-solve if it appears
-        for i in range(4):
-            title = await self._page.title()
-            if "just a moment" not in title.lower():
-                break
-            print(f"[PROMPT] CF challenge active, waiting... ({(i+1)*5}s)")
-            await asyncio.sleep(5)
+        # Wait up to 60s for CF managed challenge to auto-resolve
+        try:
+            await self._page.wait_for_function(
+                "() => !document.title.toLowerCase().includes('just a moment')",
+                timeout=60000,
+            )
+        except PlaywrightTimeout:
+            await self._save_screenshot("send_prompt_cf_block")
+            self.logged_in = False
+            raise RuntimeError("Cloudflare is blocking. Re-import cookies via POST /login/cookies.")
 
         try:
             textarea = await self._page.wait_for_selector(
@@ -152,13 +156,8 @@ class BrowserManager:
             )
         except PlaywrightTimeout:
             title = await self._page.title()
-            await self._save_screenshot("send_prompt_fail")
-            if "just a moment" in title.lower():
-                self.logged_in = False
-                raise RuntimeError(
-                    "Cloudflare is blocking. Re-import cookies via POST /login/cookies."
-                )
-            raise RuntimeError(f"Chat input not found. Page title: '{title}', URL: {self._page.url}")
+            await self._save_screenshot("send_prompt_no_textarea")
+            raise RuntimeError(f"Chat input not found. Title: '{title}', URL: {self._page.url}")
 
         await textarea.click()
         await textarea.fill(prompt)
