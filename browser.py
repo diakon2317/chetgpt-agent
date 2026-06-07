@@ -94,9 +94,9 @@ class BrowserManager:
 
     async def import_cookies(self, cookies: list) -> bool:
         """
-        Accept cookies from Cookie Editor extension (JSON export) or
-        any list of dicts with at least {name, value, domain}.
-        Writes session.json and reloads the context.
+        Accept cookies from Cookie Editor extension (JSON export).
+        Adds them to the EXISTING browser context so Cloudflare clearance
+        already present in the session is not lost.
         """
         def _samesite(v: str) -> str:
             return {"lax": "Lax", "strict": "Strict", "no_restriction": "None", "none": "None"}.get(
@@ -116,17 +116,14 @@ class BrowserManager:
                 "sameSite": _samesite(c.get("sameSite", "lax")),
             })
 
-        storage = {"cookies": pw_cookies, "origins": []}
-        Path(SESSION_FILE).write_text(json.dumps(storage), encoding="utf-8")
-        print(f"[AUTH] Saved {len(pw_cookies)} cookies to {SESSION_FILE}")
+        # Add to existing context — preserves any CF clearance the browser already has
+        await self._context.add_cookies(pw_cookies)
+        print(f"[AUTH] Added {len(pw_cookies)} cookies to existing context")
 
-        # Reload context with new session
-        if self._page:
-            await self._page.close()
-        if self._context:
-            await self._context.close()
+        # Save the merged state (server CF cookies + user auth cookies)
+        await self._context.storage_state(path=SESSION_FILE)
+        print(f"[AUTH] Merged session saved to {SESSION_FILE}")
 
-        await self._make_context(storage_state=SESSION_FILE)
         self.logged_in = await self._check_session()
         return self.logged_in
 
