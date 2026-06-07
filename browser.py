@@ -15,6 +15,13 @@ USER_AGENT = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
+CHAT_SELECTORS = [
+    "div#prompt-textarea",
+    "textarea#prompt-textarea",
+    "[data-testid='send-button']",
+    "div[contenteditable='true']",
+]
+
 
 def _ts() -> str:
     return str(int(time.time()))
@@ -34,7 +41,7 @@ class BrowserManager:
         try:
             path = DEBUG_DIR / f"{_ts()}_{name}.png"
             await self._page.screenshot(path=str(path), full_page=True)
-            print(f"[DEBUG] Screenshot saved: {path}")
+            print(f"[DEBUG] Screenshot: {path}")
         except Exception as e:
             print(f"[DEBUG] Screenshot failed: {e}")
 
@@ -58,30 +65,31 @@ class BrowserManager:
             await self._make_context()
 
     async def _check_session(self) -> bool:
+        """Navigate to chatgpt.com and wait up to 30s for CF to auto-solve."""
         print("[AUTH] Checking saved session...")
         await self._page.goto(CHAT_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(3)
-        await self._save_screenshot("session_check")
-        print(f"[AUTH] Session check URL: {self._page.url}")
 
-        # Try multiple selectors — ChatGPT changes its UI periodically
-        selectors = [
-            "textarea#prompt-textarea",
-            "div#prompt-textarea",
-            "[data-testid='send-button']",
-            "div[contenteditable='true']",
-            "main textarea",
-        ]
-        for sel in selectors:
+        # CF managed challenge can take up to 15s to auto-resolve with patchright
+        # We poll the page title: "Just a moment..." = still in CF challenge
+        for i in range(6):
+            await asyncio.sleep(5)
+            title = await self._page.title()
+            url = self._page.url
+            print(f"[AUTH] Wait {(i+1)*5}s — title: '{title}', url: {url}")
+            if "just a moment" not in title.lower():
+                break
+
+        await self._save_screenshot("session_check")
+
+        for sel in CHAT_SELECTORS:
             try:
-                await self._page.wait_for_selector(sel, timeout=8000)
-                print(f"[AUTH] Session valid — chat interface found ({sel})")
+                await self._page.wait_for_selector(sel, timeout=5000)
+                print(f"[AUTH] Session valid — chat UI found ({sel})")
                 return True
             except PlaywrightTimeout:
                 continue
 
-        print(f"[AUTH] Session check failed — no chat UI found. URL: {self._page.url}")
-        # Save HTML for diagnosis
+        print(f"[AUTH] Session check failed. URL: {self._page.url}")
         html = await self._page.content()
         (DEBUG_DIR / f"{_ts()}_session_check.html").write_text(html, encoding="utf-8")
         return False
@@ -94,9 +102,9 @@ class BrowserManager:
 
     async def import_cookies(self, cookies: list) -> bool:
         """
-        Accept cookies from Cookie Editor extension (JSON export).
-        Adds them to the EXISTING browser context so Cloudflare clearance
-        already present in the session is not lost.
+        Add auth cookies from Cookie Editor export to the existing context.
+        CF cookies are skipped (IP-tied). No second navigation is done —
+        the actual test is when /ask is first called.
         """
         def _samesite(v: str) -> str:
             return {"lax": "Lax", "strict": "Strict", "no_restriction": "None", "none": "None"}.get(
@@ -116,8 +124,7 @@ class BrowserManager:
                 "sameSite": _samesite(c.get("sameSite", "lax")),
             })
 
-        # Drop Cloudflare cookies — they are IP-tied to the source browser.
-        # The server's own CF clearance must be preserved.
+        # Skip CF cookies — they are IP-tied to the source browser
         cf_prefixes = ("cf_", "__cf", "_cf")
         auth_cookies = [c for c in pw_cookies if not any(c["name"].lower().startswith(p) for p in cf_prefixes)]
         skipped = [c["name"] for c in pw_cookies if c not in auth_cookies]
@@ -127,16 +134,38 @@ class BrowserManager:
         await self._context.add_cookies(auth_cookies)
         print(f"[AUTH] Added {len(auth_cookies)} auth cookies to existing context")
 
-        # Save the merged state (server CF cookies + user auth cookies)
+        # Save merged state — do NOT navigate again to avoid triggering CF
         await self._context.storage_state(path=SESSION_FILE)
-        print(f"[AUTH] Merged session saved to {SESSION_FILE}")
+        print(f"[AUTH] Session saved to {SESSION_FILE}. Use /ask to verify.")
 
-        self.logged_in = await self._check_session()
-        return self.logged_in
+        self.logged_in = True
+        return True
 
     async def send_prompt(self, prompt: str) -> str:
         await self._page.goto(CHAT_URL, wait_until="domcontentloaded")
-        textarea = await self._page.wait_for_selector("textarea#prompt-textarea", timeout=20000)
+
+        # Wait for CF to auto-solve if it appears
+        for i in range(4):
+            title = await self._page.title()
+            if "just a moment" not in title.lower():
+                break
+            print(f"[PROMPT] CF challenge active, waiting... ({(i+1)*5}s)")
+            await asyncio.sleep(5)
+
+        try:
+            textarea = await self._page.wait_for_selector(
+                "textarea#prompt-textarea, div#prompt-textarea", timeout=20000
+            )
+        except PlaywrightTimeout:
+            title = await self._page.title()
+            await self._save_screenshot("send_prompt_fail")
+            if "just a moment" in title.lower():
+                self.logged_in = False
+                raise RuntimeError(
+                    "Cloudflare is blocking. Re-import cookies via POST /login/cookies."
+                )
+            raise RuntimeError(f"Chat input not found. Page title: '{title}', URL: {self._page.url}")
+
         await textarea.click()
         await textarea.fill(prompt)
         await self._page.keyboard.press("Enter")
