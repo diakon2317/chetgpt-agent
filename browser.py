@@ -1,11 +1,11 @@
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
 from patchright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 SESSION_FILE = "session.json"
-LOGIN_URL = "https://chatgpt.com/auth/login"
 CHAT_URL = "https://chatgpt.com/"
 DEBUG_DIR = Path("debug_screenshots")
 
@@ -14,22 +14,6 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
-
-# Auth0 / OpenAI могут менять селекторы — пробуем все варианты
-EMAIL_SELECTORS = [
-    "input[name='username']",
-    "input[name='email']",
-    "input[type='email']",
-    "input[id='email-input']",
-    "input[id='username']",
-]
-
-CODE_SELECTORS = [
-    "input[name='code']",
-    "input[name='otp']",
-    "input[autocomplete='one-time-code']",
-    "input[id='code']",
-]
 
 
 def _ts() -> str:
@@ -54,36 +38,24 @@ class BrowserManager:
         except Exception as e:
             print(f"[DEBUG] Screenshot failed: {e}")
 
-    async def _stealth_init(self):
-        # patchright patches the binary — no JS overrides needed
-        pass
+    async def _make_context(self, storage_state=None):
+        kwargs = dict(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
+        if storage_state:
+            kwargs["storage_state"] = storage_state
+        self._context = await self._browser.new_context(**kwargs)
+        self._page = await self._context.new_page()
 
     async def start(self):
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--lang=en-US",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--lang=en-US"],
         )
         if Path(SESSION_FILE).exists():
-            self._context = await self._browser.new_context(
-                storage_state=SESSION_FILE,
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 800},
-            )
-            await self._stealth_init()
-            self._page = await self._context.new_page()
+            await self._make_context(storage_state=SESSION_FILE)
             self.logged_in = await self._check_session()
         else:
-            self._context = await self._browser.new_context(
-                user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 800},
-            )
-            await self._stealth_init()
-            self._page = await self._context.new_page()
+            await self._make_context()
 
     async def _check_session(self) -> bool:
         print("[AUTH] Checking saved session...")
@@ -103,97 +75,43 @@ class BrowserManager:
     async def page_html(self) -> str:
         return await self._page.content()
 
-    async def _find_and_fill(self, selectors: list[str], value: str, label: str) -> bool:
-        for sel in selectors:
-            try:
-                el = await self._page.wait_for_selector(sel, timeout=3000)
-                await el.click()
-                await el.fill(value)
-                print(f"[AUTH] Filled {label} using selector: {sel}")
-                return True
-            except PlaywrightTimeout:
-                continue
-        return False
-
-    async def start_login(self):
-        print(f"[AUTH] Navigating to {LOGIN_URL}")
-        await self._page.goto(LOGIN_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-        await self._save_screenshot("01_login_page")
-        print(f"[AUTH] Current URL: {self._page.url}")
-
-        # Нажимаем "Log in" если кнопка есть
-        for selector in ["button:has-text('Log in')", "a:has-text('Log in')", "[data-testid='login-button']"]:
-            try:
-                await self._page.click(selector, timeout=4000)
-                print(f"[AUTH] Clicked login button: {selector}")
-                await asyncio.sleep(2)
-                break
-            except PlaywrightTimeout:
-                continue
-
-        await self._save_screenshot("02_after_login_click")
-        print(f"[AUTH] URL after login click: {self._page.url}")
-
-        # Ищем поле email по нескольким вариантам
-        found = await self._find_and_fill(EMAIL_SELECTORS, os.getenv("CHATGPT_EMAIL", ""), "email")
-        if not found:
-            await self._save_screenshot("02_email_field_not_found")
-            # Сохраним HTML для диагностики
-            html = await self._page.content()
-            (DEBUG_DIR / f"{_ts()}_page.html").write_text(html, encoding="utf-8")
-            raise RuntimeError(
-                f"Email input not found. URL: {self._page.url}. "
-                f"Tried selectors: {EMAIL_SELECTORS}. "
-                "Check debug_screenshots/ for screenshots and HTML."
+    async def import_cookies(self, cookies: list) -> bool:
+        """
+        Accept cookies from Cookie Editor extension (JSON export) or
+        any list of dicts with at least {name, value, domain}.
+        Writes session.json and reloads the context.
+        """
+        def _samesite(v: str) -> str:
+            return {"lax": "Lax", "strict": "Strict", "no_restriction": "None", "none": "None"}.get(
+                (v or "").lower(), "Lax"
             )
 
-        await self._save_screenshot("03_email_filled")
+        pw_cookies = []
+        for c in cookies:
+            pw_cookies.append({
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain", ".chatgpt.com"),
+                "path": c.get("path", "/"),
+                "expires": float(c.get("expirationDate", c.get("expires", -1))),
+                "httpOnly": bool(c.get("httpOnly", False)),
+                "secure": bool(c.get("secure", False)),
+                "sameSite": _samesite(c.get("sameSite", "lax")),
+            })
 
-        # Submit email
-        await self._page.keyboard.press("Enter")
-        await asyncio.sleep(2)
-        await self._save_screenshot("04_after_email_submit")
-        print(f"[AUTH] URL after email submit: {self._page.url}")
+        storage = {"cookies": pw_cookies, "origins": []}
+        Path(SESSION_FILE).write_text(json.dumps(storage), encoding="utf-8")
+        print(f"[AUTH] Saved {len(pw_cookies)} cookies to {SESSION_FILE}")
 
-        # Ждём поле для кода
-        code_found = False
-        for sel in CODE_SELECTORS:
-            try:
-                await self._page.wait_for_selector(sel, timeout=20000)
-                print(f"[AUTH] Code field found: {sel}")
-                code_found = True
-                break
-            except PlaywrightTimeout:
-                continue
+        # Reload context with new session
+        if self._page:
+            await self._page.close()
+        if self._context:
+            await self._context.close()
 
-        await self._save_screenshot("05_code_page")
-        if not code_found:
-            html = await self._page.content()
-            (DEBUG_DIR / f"{_ts()}_code_page.html").write_text(html, encoding="utf-8")
-            raise RuntimeError(
-                f"Code input not found after email submit. URL: {self._page.url}. "
-                "Check debug_screenshots/ — возможно, нужен пароль, а не код."
-            )
-
-    async def verify_login(self, code: str):
-        found = await self._find_and_fill(CODE_SELECTORS, code, "code")
-        if not found:
-            raise RuntimeError("Code input field not found on page")
-
-        await self._page.keyboard.press("Enter")
-        await self._save_screenshot("06_code_submitted")
-
-        try:
-            await self._page.wait_for_url("https://chatgpt.com/**", timeout=30000)
-        except PlaywrightTimeout:
-            await self._save_screenshot("06_wait_url_timeout")
-            raise RuntimeError(f"Did not reach chatgpt.com after code. URL: {self._page.url}")
-
-        await self._context.storage_state(path=SESSION_FILE)
-        self.logged_in = True
-        await self._save_screenshot("07_logged_in")
-        print("[AUTH] Login successful, session saved")
+        await self._make_context(storage_state=SESSION_FILE)
+        self.logged_in = await self._check_session()
+        return self.logged_in
 
     async def send_prompt(self, prompt: str) -> str:
         await self._page.goto(CHAT_URL, wait_until="domcontentloaded")

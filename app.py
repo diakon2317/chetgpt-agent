@@ -28,8 +28,8 @@ class AskRequest(BaseModel):
     prompt: str
 
 
-class VerifyRequest(BaseModel):
-    code: str
+class CookiesRequest(BaseModel):
+    cookies: list
 
 
 @app.get("/health")
@@ -37,20 +37,20 @@ async def health():
     return {"status": "ok", "logged_in": browser.logged_in}
 
 
-@app.post("/login")
-async def login():
+@app.post("/login/cookies")
+async def import_cookies(req: CookiesRequest):
+    """
+    Import cookies exported from a real browser (Cookie Editor extension → Export All).
+    This bypasses Cloudflare since we reuse an already-authenticated session.
+    """
     try:
-        await browser.start_login()
-        return {"message": "Code sent to email. Call POST /login/verify with the code."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/login/verify")
-async def verify(req: VerifyRequest):
-    try:
-        await browser.verify_login(req.code)
-        return {"message": "Logged in successfully. Session saved."}
+        success = await browser.import_cookies(req.cookies)
+        if success:
+            return {"message": "Cookies imported and session verified. Ready to use /ask."}
+        raise HTTPException(
+            status_code=400,
+            detail="Cookies imported but session check failed — cookies may be expired or missing required ones.",
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -58,7 +58,7 @@ async def verify(req: VerifyRequest):
 @app.post("/ask")
 async def ask(req: AskRequest):
     if not browser.logged_in:
-        raise HTTPException(status_code=401, detail="Not logged in. Call POST /login first.")
+        raise HTTPException(status_code=401, detail="Not logged in. Import cookies via POST /login/cookies first.")
     async with browser.lock:
         try:
             response = await browser.send_prompt(req.prompt)
@@ -75,13 +75,11 @@ async def history(limit: int = 20):
 
 @app.get("/debug/screenshot")
 async def debug_screenshot():
-    """Скриншот того что сейчас видит браузер — для диагностики."""
     img = await browser.screenshot()
     return Response(content=img, media_type="image/png")
 
 
 @app.get("/debug/html")
 async def debug_html():
-    """HTML страницы что сейчас открыта в браузере — для диагностики."""
     html = await browser.page_html()
     return Response(content=html, media_type="text/html")
